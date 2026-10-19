@@ -37,7 +37,9 @@ jobs:
       - name: Create demo
         run: |
           mv JSWebGit.tgz output
-          cp README.html output/index.html
+          echo '<html lang="en"> <head> <meta charset="utf-8"> <title>JSWebGit Demo</title> </head> <body>' > output/index.html
+          cat README.md >> output/index.html
+          echo '</body> </html>' >> output/index.html
           (cd output; echo "JSWebGit https://github.com/opcode-eu-org-libs/JSWebGit.git" | ./make-repos.sh useCurrent)
 
       - name: Upload artifact
