@@ -1,0 +1,867 @@
+<!doctype html>
+<!--
+SPDX-FileCopyrightText: Robert Ryszard Paciorek <rrp@opcode.eu.org>
+SPDX-License-Identifier: MIT
+
+Created with ChatGPT AI, 2026
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Git Browser</title>
+  <link rel="stylesheet" href="/git.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">◈ Git Browser</div>
+    <div id="repoUrl" class="subtitle">Reading repository via HTTP…</div>
+  </header>
+
+  <div class="toolbar">
+    <div class="control">
+      <label for="branchSelect">Branch</label>
+      <select id="branchSelect" aria-label="Select branch" disabled>
+        <option>Loading…</option>
+      </select>
+    </div>
+    <button id="historyToggle" type="button">Commit history</button>
+    <div class="control commit-control">
+      <label for="currentCommit">Viewing commit</label>
+      <span id="currentCommit"></span>
+    </div>
+    <div id="repoDownload" class="repo-download">
+      <button id="repoDownloadToggle" type="button" aria-haspopup="true" aria-expanded="false">Download / Clone ▾</button>
+      <div id="repoDownloadMenu" class="repo-download-menu hidden" role="menu" aria-label="Download or clone repository">
+        <div class="clone-command">
+          <label for="cloneCommand">Clone with HTTPS</label>
+          <div class="clone-command-row">
+            <code id="cloneCommand">git clone $BASE_URL</code>
+            <button id="copyCloneCommand" type="button" aria-label="Copy git clone command" title="Copy command">Copy</button>
+          </div>
+        </div>
+        <button id="repoZipDownload" type="button" role="menuitem">Download ZIP archive</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="notice" class="notice hidden" role="status" aria-live="polite"><div></div></div>
+
+  <main class="layout">
+    <aside class="panel file-panel">
+      <div id="directoryTitle" class="breadcrumbs">Files</div>
+      <div id="fileList"><div class="empty">Loading files…</div></div>
+    </aside>
+
+    <section class="panel main-panel">
+      <div id="fileView">
+        <div id="viewMeta" class="view-meta">
+          <span id="viewTitle" class="view-title"></span>
+          <span id="fileActions" class="file-actions"></span>
+        </div>
+        <div id="content"><div class="empty">Loading repository…</div></div>
+      </div>
+
+      <div id="historyView" class="hidden">
+        <div class="panel-heading">Commit history</div>
+        <ul id="historyList" class="history-list"><li class="empty">History has not been loaded yet.</li></ul>
+        <div id="historyFooter" class="history-footer hidden"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">Read-only view. Objects are fetched from the Dumb HTTP server and cached in the browser’s IndexedDB.</footer>
+
+  <script type="module">
+    const useServerSideCurrent = false;
+    
+    import { Buffer } from '/buffer.js';
+
+    window.Buffer = Buffer;
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error(`Failed to load ${src}`));
+        document.head.appendChild(script);
+      });
+    }
+
+    await loadScript('/lightning-fs.js');
+    await loadScript('/isomorphic-git.js');
+
+    (() => {
+      'use strict';
+
+      const git = window.git;
+      const LightningFS = window.LightningFS;
+      const BASE_URL = new URL('.', window.location.href).href;
+      const GIT_DIR = '/remote-bare-repo';
+      const $ = id => document.getElementById(id);
+      const params = new URLSearchParams(window.location.search);
+      const requestedPath = normalizeRepoPath(params.get('path') || '');
+      const requestedBranch = params.get('branch');
+      const requestedCommit = params.get('commit');
+      let historyDepth = Math.min(1000, Math.max(50, Number.parseInt(params.get('history') || '50', 10) || 50));
+
+      let localFS;
+      let localPromises;
+      let fs;
+      let packNames = [];
+      let branches = [];
+      let branchOids = Object.create(null);
+      let defaultBranch = null;
+      let headOid = null;
+      let selectedBranch = null;
+      let selectedCommit = null;
+      let branchTip = null;
+      let historyLoadedDepth = 0;
+      let historyLoading = false;
+      let historyVisible = false;
+
+      const packedObjectOids = new Set();
+      const remoteFetches = new Map();
+
+      function normalizeRepoPath(path) {
+        return String(path || '').split('/').filter(part => part && part !== '.' && part !== '..').join('/');
+      }
+
+      function normalizeFsPath(path) {
+        const parts = String(path).replace(/\\/g, '/').split('/');
+        const result = [];
+        for (const part of parts) {
+          if (!part || part === '.') continue;
+          if (part === '..') result.pop();
+          else result.push(part);
+        }
+        return '/' + result.join('/');
+      }
+
+      function repoUrl(path) {
+        return BASE_URL + String(path || '').split('/').filter(Boolean).map(encodeURIComponent).join('/');
+      }
+
+      function shortOid(oid) {
+        return oid ? oid.slice(0, 10) : '';
+      }
+
+      function makeElement(tag, className = '', text) {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text !== undefined) element.textContent = text;
+        return element;
+      }
+
+      function setNotice(message = '', isError = false) {
+        $('notice').classList.toggle('hidden', !message);
+        $('notice').classList.toggle('error', isError);
+        $('notice').firstElementChild.textContent = message;
+      }
+
+      async function fetchRepoFile(path, optional = false) {
+        const response = await fetch(repoUrl(path), { cache: 'no-store', credentials: 'same-origin' });
+        if (optional && (response.status === 404 || response.status === 410)) return null;
+        if (!response.ok) throw new Error(`Unable to fetch ${path}: HTTP ${response.status}.`);
+        return response;
+      }
+
+      async function fetchRepoText(path, optional = false) {
+        const response = await fetchRepoFile(path, optional);
+        return response ? response.text() : '';
+      }
+
+      function parseInfoRefs(text) {
+        const result = Object.create(null);
+        for (const line of text.split(/\r?\n/)) {
+          const match = line.match(/^([0-9a-f]{40,64})\s+(refs\/heads\/[^\s]+)$/i);
+          if (match) result[match[2].slice('refs/heads/'.length)] = match[1].toLowerCase();
+        }
+        return result;
+      }
+
+      function parsePackList(text) {
+        return [...new Set(text.split(/\r?\n/)
+          .map(line => line.match(/^P\s+(pack-[0-9a-f]+\.pack)\s*$/i))
+          .filter(Boolean).map(match => match[1]))];
+      }
+
+      function cacheId(text) {
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) {
+          hash ^= text.charCodeAt(i);
+          hash = Math.imul(hash, 16777619);
+        }
+        return 'git-browser-' + (hash >>> 0).toString(16);
+      }
+
+      async function ensureDir(path) {
+        let current = '';
+        for (const part of normalizeFsPath(path).split('/').filter(Boolean)) {
+          current += '/' + part;
+          try {
+            await localPromises.mkdir(current);
+          } catch (error) {
+            if (error.code === 'EEXIST') continue;
+            try { await localPromises.readdir(current); }
+            catch { throw error; }
+          }
+        }
+      }
+
+      async function ensureParent(path) {
+        const parent = normalizeFsPath(path).split('/').slice(0, -1).join('/') || '/';
+        await ensureDir(parent);
+      }
+
+      function remoteRelativePath(path) {
+        if (typeof path !== 'string') return null;
+        const normalized = normalizeFsPath(path);
+        const prefix = normalizeFsPath(GIT_DIR) + '/';
+        let relative = normalized.startsWith(prefix) ? normalized.slice(prefix.length) : '';
+        if (!relative) {
+          const marker = '/objects/';
+          const index = normalized.lastIndexOf(marker);
+          if (index >= 0) relative = normalized.slice(index + 1);
+        }
+        const basename = normalized.split('/').pop();
+        if (!relative && /^pack-[0-9a-f]+\.(?:idx|pack)$/i.test(basename)) relative = 'objects/pack/' + basename;
+        return /^(?:objects\/pack\/pack-[0-9a-f]+\.(?:idx|pack)|objects\/[0-9a-f]{2}\/(?:[0-9a-f]{38}|[0-9a-f]{62}))$/i.test(relative)
+          ? relative : null;
+      }
+
+      function isPackAsset(path) {
+        return /^objects\/pack\/pack-[0-9a-f]+\.(?:idx|pack)$/i.test(path || '');
+      }
+
+      function isLooseObject(path) {
+        return /^objects\/[0-9a-f]{2}\/(?:[0-9a-f]{38}|[0-9a-f]{62})$/i.test(path || '');
+      }
+
+      function asUint8Array(value) {
+        if (value instanceof Uint8Array) return value;
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        if (typeof value === 'string') return Uint8Array.from(value, char => char.charCodeAt(0) & 0xff);
+        return new Uint8Array(value);
+      }
+
+      function parsePackIndexOids(value) {
+        const bytes = asUint8Array(value);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const count = view.getUint32(8 + 255 * 4, false);
+        const offset = 8 + 256 * 4;
+        const result = new Array(count);
+        for (let i = 0; i < count; i++) {
+          const start = offset + i * 20;
+          let oid = '';
+          for (let j = 0; j < 20; j++) oid += bytes[start + j].toString(16).padStart(2, '0');
+          result[i] = oid;
+        }
+        return result;
+      }
+
+
+      function installDumbHttpFallback() {
+        const promises = localPromises;
+        const readFile = promises.readFile.bind(promises);
+        const writeFile = promises.writeFile.bind(promises);
+
+        async function fetchAndCache(relative, localError) {
+          if (remoteFetches.has(relative)) return remoteFetches.get(relative);
+          const request = (async () => {
+            const response = await fetchRepoFile(relative, true);
+            if (!response) throw localError;
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            const path = GIT_DIR + '/' + relative;
+            await ensureParent(path);
+            await writeFile(path, bytes);
+            if (/\.idx$/i.test(relative)) {
+              for (const oid of parsePackIndexOids(bytes)) packedObjectOids.add(oid);
+            }
+            return bytes;
+          })();
+          remoteFetches.set(relative, request);
+          try { return await request; }
+          finally { if (remoteFetches.get(relative) === request) remoteFetches.delete(relative); }
+        }
+
+        const descriptor = Object.getOwnPropertyDescriptor(promises, 'readFile');
+        Object.defineProperty(promises, 'readFile', {
+          configurable: true,
+          enumerable: descriptor ? descriptor.enumerable : true,
+          writable: true,
+          value: async function(path, options) {
+            if (path == null) return readFile(path, options);
+            const relative = remoteRelativePath(String(path));
+            try { return await readFile(path, options); }
+            catch (error) {
+              if (isPackAsset(relative)) return fetchAndCache(relative, error);
+              if (!isLooseObject(relative)) throw error;
+              const oid = relative.slice('objects/'.length).replace('/', '').toLowerCase();
+              if (packedObjectOids.has(oid)) throw error;
+              return fetchAndCache(relative, error);
+            }
+          }
+        });
+
+        fs = localFS;
+      }
+
+      async function preloadPackIndexes() {
+        packedObjectOids.clear();
+        for (const packName of packNames) {
+          const relative = 'objects/pack/' + packName.replace(/\.pack$/i, '.idx');
+          const bytes = asUint8Array(await localPromises.readFile(GIT_DIR + '/' + relative));
+          for (const oid of parsePackIndexOids(bytes)) packedObjectOids.add(oid);
+        }
+      }
+
+      async function writeLocalRef(ref, oid) {
+        const path = GIT_DIR + '/' + ref;
+        await ensureParent(path);
+        await localPromises.writeFile(path, oid + '\n', { encoding: 'utf8' });
+      }
+
+      function buildUrl({ branch = selectedBranch, commit = selectedCommit, path = requestedPath, history = historyDepth } = {}) {
+        const url = new URL(window.location.href);
+        url.search = '';
+        if (branch && branch !== defaultBranch) url.searchParams.set('branch', branch);
+        if (commit && commit !== headOid) url.searchParams.set('commit', commit);
+        if (path) url.searchParams.set('path', path);
+        if (history > 50) url.searchParams.set('history', String(history));
+        return url.pathname + url.search + url.hash;
+      }
+
+      function navigate(state) {
+        window.location.href = buildUrl(state);
+      }
+
+      // Minimal ZIP writer (STORE method, no compression dependency).
+      // It creates a standards-compliant ZIP archive entirely in the browser.
+      const ZIP_CRC_TABLE = (() => {
+        const table = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+          let c = n;
+          for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+          table[n] = c >>> 0;
+        }
+        return table;
+      })();
+
+      function zipCrc32(bytes) {
+        let crc = 0xffffffff;
+        for (const byte of bytes) crc = ZIP_CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+        return (crc ^ 0xffffffff) >>> 0;
+      }
+
+      function concatBytes(parts) {
+        const total = parts.reduce((sum, part) => sum + part.length, 0);
+        const result = new Uint8Array(total);
+        let offset = 0;
+        for (const part of parts) {
+          result.set(part, offset);
+          offset += part.length;
+        }
+        return result;
+      }
+
+      function zipDosDateTime(date = new Date()) {
+        const year = Math.max(1980, date.getFullYear());
+        return {
+          time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+          date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate()
+        };
+      }
+
+      function createZipArchive(files) {
+        const encoder = new TextEncoder();
+        const localParts = [];
+        const centralParts = [];
+        let localOffset = 0;
+        const stamp = zipDosDateTime();
+
+        for (const file of files) {
+          const nameBytes = encoder.encode(file.path);
+          const data = asUint8Array(file.bytes);
+          const crc = zipCrc32(data);
+
+          const localHeader = new Uint8Array(30 + nameBytes.length);
+          const localView = new DataView(localHeader.buffer);
+          localView.setUint32(0, 0x04034b50, true);
+          localView.setUint16(4, 20, true);
+          localView.setUint16(6, 0x0800, true); // UTF-8 filenames
+          localView.setUint16(8, 0, true); // STORE, no compression
+          localView.setUint16(10, stamp.time, true);
+          localView.setUint16(12, stamp.date, true);
+          localView.setUint32(14, crc, true);
+          localView.setUint32(18, data.length, true);
+          localView.setUint32(22, data.length, true);
+          localView.setUint16(26, nameBytes.length, true);
+          localView.setUint16(28, 0, true);
+          localHeader.set(nameBytes, 30);
+          localParts.push(localHeader, data);
+
+          const centralHeader = new Uint8Array(46 + nameBytes.length);
+          const centralView = new DataView(centralHeader.buffer);
+          centralView.setUint32(0, 0x02014b50, true);
+          centralView.setUint16(4, 0x0314, true); // Unix creator, ZIP 2.0
+          centralView.setUint16(6, 20, true);
+          centralView.setUint16(8, 0x0800, true);
+          centralView.setUint16(10, 0, true);
+          centralView.setUint16(12, stamp.time, true);
+          centralView.setUint16(14, stamp.date, true);
+          centralView.setUint32(16, crc, true);
+          centralView.setUint32(20, data.length, true);
+          centralView.setUint32(24, data.length, true);
+          centralView.setUint16(28, nameBytes.length, true);
+          centralView.setUint16(30, 0, true);
+          centralView.setUint16(32, 0, true);
+          centralView.setUint16(34, 0, true);
+          centralView.setUint16(36, 0, true);
+          centralView.setUint32(38, 0, true);
+          centralView.setUint32(42, localOffset, true);
+          centralHeader.set(nameBytes, 46);
+          centralParts.push(centralHeader);
+
+          localOffset += localHeader.length + data.length;
+        }
+
+        const centralDirectory = concatBytes(centralParts);
+        const localData = concatBytes(localParts);
+        const end = new Uint8Array(22);
+        const endView = new DataView(end.buffer);
+        endView.setUint32(0, 0x06054b50, true);
+        endView.setUint16(4, 0, true);
+        endView.setUint16(6, 0, true);
+        endView.setUint16(8, files.length, true);
+        endView.setUint16(10, files.length, true);
+        endView.setUint32(12, centralDirectory.length, true);
+        endView.setUint32(16, localData.length, true);
+        endView.setUint16(20, 0, true);
+        return new Blob([localData, centralDirectory, end], { type: 'application/zip' });
+      }
+
+      async function collectCommitFiles(treeOid, prefix = '', files = []) {
+        const result = await git.readTree({ fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: treeOid });
+        for (const entry of result.tree) {
+          const path = prefix ? `${prefix}/${entry.path}` : entry.path;
+          if (entry.type === 'tree') {
+            await collectCommitFiles(entry.oid, path, files);
+          } else if (entry.type === 'blob') {
+            const { blob } = await git.readBlob({ fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: entry.oid });
+            files.push({ path, bytes: blob });
+          }
+          // Gitlinks (submodules) are intentionally omitted: their contents
+          // are stored in separate repositories and are not part of this tree.
+        }
+        return files;
+      }
+
+      async function downloadCommitArchive() {
+        const button = $('repoZipDownload');
+        if (button.disabled) return;
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Preparing ZIP…';
+        try {
+          const commitResult = await git.readCommit({
+            fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: selectedCommit
+          });
+          const files = await collectCommitFiles(commitResult.commit.tree);
+          if (!files.length) throw new Error('This commit contains no files to archive.');
+          const archive = createZipArchive(files);
+          const repoName = new URL(BASE_URL).pathname.replace(/\/+$/, '').split('/').pop() || 'repository';
+          const filename = `${repoName}-${shortOid(selectedCommit)}.zip`;
+          const url = URL.createObjectURL(archive);
+          const link = makeElement('a');
+          link.href = url;
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 30000);
+          button.textContent = 'ZIP downloaded';
+        } catch (error) {
+          setNotice(`Unable to create ZIP archive: ${error?.message || String(error)}`, true);
+          button.textContent = 'ZIP failed';
+        } finally {
+          button.disabled = false;
+          setTimeout(() => { button.textContent = originalText; }, 2500);
+        }
+      }
+
+      function setupRepoDownloadMenu() {
+        const toggle = $('repoDownloadToggle');
+        const menu = $('repoDownloadMenu');
+        const command = `git clone ${BASE_URL}`;
+        $('cloneCommand').textContent = command;
+        $('repoZipDownload').addEventListener('click', downloadCommitArchive);
+
+        toggle.addEventListener('click', () => {
+          const isOpen = !menu.classList.contains('hidden');
+          menu.classList.toggle('hidden', isOpen);
+          toggle.setAttribute('aria-expanded', String(!isOpen));
+        });
+
+        $('copyCloneCommand').addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(command);
+            $('copyCloneCommand').textContent = 'Copied';
+          } catch {
+            const textarea = makeElement('textarea');
+            textarea.value = command;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            const copied = document.execCommand('copy');
+            textarea.remove();
+            $('copyCloneCommand').textContent = copied ? 'Copied' : 'Copy failed';
+          }
+        });
+
+        document.addEventListener('click', event => {
+          if (!menu.contains(event.target) && !toggle.contains(event.target)) {
+            menu.classList.add('hidden');
+            toggle.setAttribute('aria-expanded', 'false');
+          }
+        });
+        document.addEventListener('keydown', event => {
+          if (event.key === 'Escape') {
+            menu.classList.add('hidden');
+            toggle.setAttribute('aria-expanded', 'false');
+            toggle.focus();
+          }
+        });
+      }
+
+      function setupBranchSelect() {
+        const select = $('branchSelect');
+        select.replaceChildren();
+        for (const branch of branches) {
+          const option = makeElement('option', '', branch);
+          option.value = branch;
+          option.selected = branch === selectedBranch;
+          select.appendChild(option);
+        }
+        select.disabled = branches.length < 2;
+        select.addEventListener('change', () => navigate({ branch: select.value, commit: branchOids[select.value], path: '', history: 50 }));
+      }
+
+      async function getPathEntry(commitOid, repoPath) {
+        const commitResult = await git.readCommit({ fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: commitOid });
+        let treeOid = commitResult.commit.tree;
+        const path = normalizeRepoPath(repoPath);
+        if (!path) return { type: 'tree', oid: treeOid, path: '' };
+        const segments = path.split('/');
+        let found;
+        for (let i = 0; i < segments.length; i++) {
+          const result = await git.readTree({ fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: treeOid });
+          found = result.tree.find(item => item.path === segments[i]);
+          if (!found) return null;
+          if (i < segments.length - 1) {
+            if (found.type !== 'tree') return null;
+            treeOid = found.oid;
+          }
+        }
+        return { ...found, path };
+      }
+
+      function parentPath(path) {
+        return normalizeRepoPath(path).split('/').slice(0, -1).join('/');
+      }
+
+      function renderBreadcrumbs(containerId, path) {
+        const container = $(containerId);
+        container.replaceChildren();
+        const name = new URL(BASE_URL).pathname.split('/').reverse()[1];
+        const root = makeElement('a', '', name ? name : 'repozytorium' );
+        root.href = buildUrl({ path: '' });
+        container.appendChild(root);
+        container.append(makeElement('span', 'sep', '/'));
+        let prefix = '';
+        for (const part of normalizeRepoPath(path).split('/').filter(Boolean)) {
+          prefix = prefix ? prefix + '/' + part : part;
+          const link = makeElement('a', '', part);
+          link.href = buildUrl({ path: prefix });
+          container.appendChild(link);
+          container.append(makeElement('span', 'sep', '/'));
+        }
+      }
+
+      async function renderDirectory(treeOid, directoryPath, activePath = '') {
+        renderBreadcrumbs('directoryTitle', directoryPath);
+        const container = $('fileList');
+        container.replaceChildren();
+        const result = await git.readTree({ fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: treeOid });
+        const entries = result.tree.slice().sort((a, b) => {
+          const aDir = a.type === 'tree' ? 0 : 1;
+          const bDir = b.type === 'tree' ? 0 : 1;
+          return aDir - bDir || a.path.localeCompare(b.path, 'en', { numeric: true, sensitivity: 'base' });
+        });
+
+        if (!entries.length && !directoryPath) {
+          container.appendChild(makeElement('div', 'empty', 'This directory is empty.'));
+          return;
+        }
+
+        const table = makeElement('table', 'file-table');
+        const body = makeElement('tbody');
+        if (directoryPath) {
+          const row = makeElement('tr', 'parent-row');
+          const cell = makeElement('td', 'name');
+          const link = makeElement('a', '', '↰ ..');
+          link.href = buildUrl({ path: parentPath(directoryPath) });
+          cell.appendChild(link);
+          row.appendChild(cell);
+          body.appendChild(row);
+        }
+
+        for (const entry of entries) {
+          const path = directoryPath ? directoryPath + '/' + entry.path : entry.path;
+          const row = makeElement('tr', path === activePath ? 'selected-file' : '');
+          const cell = makeElement('td', 'name');
+          const icon = entry.type === 'tree' ? '▰' : entry.type === 'commit' ? '↗' : '▤';
+          cell.appendChild(makeElement('span', 'entry-icon', icon));
+          const link = makeElement('a', '', entry.path + (entry.type === 'tree' ? '/' : ''));
+          link.href = buildUrl({ path });
+          cell.appendChild(link);
+          row.appendChild(cell);
+          body.appendChild(row);
+        }
+        table.appendChild(body);
+        container.appendChild(table);
+      }
+
+      function showDirectoryPrompt(path) {
+        $('viewTitle').textContent = ' ';
+        $('fileActions').replaceChildren();
+        $('content').replaceChildren(makeElement('div', 'empty', 'Select a file from the list on the left to view its contents.'));
+      }
+
+      function isBinary(bytes) {
+        for (let i = 0; i < Math.min(bytes.length, 8192); i++) if (bytes[i] === 0) return true;
+        return false;
+      }
+
+      async function saveBytes(bytes, filename) {
+        const blob = new Blob([bytes], { type: 'application/octet-stream' });
+        if (typeof window.showSaveFilePicker === 'function') {
+          try {
+            const handle = await window.showSaveFilePicker({ suggestedName: filename || 'download' });
+            const writable = await handle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+            return;
+          } catch (error) {
+            if (error.name === 'AbortError') return;
+          }
+        }
+        const url = URL.createObjectURL(blob);
+        const link = makeElement('a');
+        link.href = url;
+        link.download = filename || 'download';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      }
+
+      function renderFileActions(path, bytes) {
+        const actions = $('fileActions');
+        actions.replaceChildren();
+        if (useServerSideCurrent && selectedCommit === headOid) {
+          const link = makeElement('a', 'button-link', 'Raw / Download');
+          link.href = repoUrl('current/' + path);
+          link.title = 'Open the file using the server URL /current/…';
+          actions.appendChild(link);
+        } else {
+          const button = makeElement('button', '', 'Download raw');
+          button.type = 'button';
+          button.addEventListener('click', () => saveBytes(bytes, path.split('/').pop()));
+          actions.appendChild(button);
+        }
+      }
+
+      async function renderFile(entry, path) {
+        $('viewTitle').textContent = path.split('/').reverse()[0];
+        $('content').replaceChildren();
+        const { blob } = await git.readBlob({ fs, dir: GIT_DIR, gitdir: GIT_DIR, oid: entry.oid });
+        renderFileActions(path, blob);
+        const fileInfo = makeElement('div', 'file-info', '')
+        fileInfo.appendChild(makeElement('span', '', `${entry.oid}`))
+        fileInfo.appendChild(makeElement('span', '', `${formatSize(blob.byteLength)}`))
+        $('content').appendChild(fileInfo);
+        if (isBinary(blob)) {
+          $('content').appendChild(makeElement('div', 'empty', 'Ten plik wygląda na binarny. Użyj „Raw / Download”, aby zapisać oryginalne bajty.'));
+          return;
+        }
+        const text = new TextDecoder('utf-8').decode(blob);
+        const limit = 1024 * 1024;
+        const pre = makeElement('pre', '', text.length > limit ? text.slice(0, limit) : text);
+        $('content').appendChild(pre);
+        if (text.length > limit) $('content').appendChild(makeElement('div', 'empty', 'Podgląd przycięto do 1 MiB znaków. Download raw, aby zapisać całość.'));
+      }
+
+      function formatSize(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KiB';
+        return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+      }
+
+      function formatDate(seconds) {
+        const date = new Date(seconds * 1000);
+        return date.toISOString().replace("T", " ").replace(".000Z", " UTC");
+      }
+
+      function renderHistory(commits) {
+        const list = $('historyList');
+        list.replaceChildren();
+        if (!commits.length) list.appendChild(makeElement('li', 'empty', 'No commits to display.'));
+        for (const item of commits) {
+          const li = makeElement('li', 'history-item' + (item.oid === selectedCommit ? ' current' : ''));
+          const message = (item.commit.message || '(no description)').split(/\r?\n/, 1)[0];
+          const link = makeElement('a', 'commit-message', message);
+          link.href = buildUrl({ commit: item.oid, path: '' });
+          const meta = makeElement('div', 'history-meta', `${item.commit.author.name || 'Unknown author'} · ${formatDate(item.commit.author.timestamp)}`);
+          const detail = makeElement('div', 'history-meta');
+          const oidLink = makeElement('a', 'oid', shortOid(item.oid));
+          oidLink.href = buildUrl({ commit: item.oid, path: '' });
+          detail.appendChild(oidLink);
+          if (item.oid === branchTip) detail.appendChild(makeElement('span', 'muted', ' · branch HEAD'));
+          li.append(link, meta, detail);
+          list.appendChild(li);
+        }
+
+        const footer = $('historyFooter');
+        footer.replaceChildren();
+        if (commits.length >= historyDepth && historyDepth < 1000) {
+          const button = makeElement('button', '', `Show older commits (+${Math.min(50, 1000 - historyDepth)})`);
+          button.addEventListener('click', async () => {
+            historyDepth = Math.min(1000, historyDepth + 50);
+            window.history.replaceState(null, '', buildUrl({ history: historyDepth }));
+            await loadHistory();
+          });
+          footer.appendChild(button);
+          footer.classList.remove('hidden');
+        } else {
+          footer.classList.add('hidden');
+        }
+      }
+
+      async function loadHistory() {
+        if (historyLoading || historyLoadedDepth >= historyDepth) return;
+        historyLoading = true;
+        $('historyList').replaceChildren(makeElement('li', 'empty', 'Loading history…'));
+        try {
+          const commits = await git.log({ fs, dir: GIT_DIR, gitdir: GIT_DIR, ref: 'refs/heads/__viewer_history', depth: historyDepth });
+          historyLoadedDepth = historyDepth;
+          renderHistory(commits);
+        } finally {
+          historyLoading = false;
+        }
+      }
+
+      async function toggleHistory() {
+        historyVisible = !historyVisible;
+        $('fileView').classList.toggle('hidden', historyVisible);
+        $('historyView').classList.toggle('hidden', !historyVisible);
+        $('historyToggle').textContent = historyVisible ? 'Show files' : 'Commit history';
+        if (historyVisible) {
+          try { await loadHistory(); }
+          catch (error) {
+            $('historyList').replaceChildren(makeElement('li', 'empty', error.message || String(error)));
+          }
+        }
+      }
+
+      async function start() {
+        $('repoUrl').textContent = BASE_URL;
+        setupRepoDownloadMenu();
+        setNotice('Fetching repository references…');
+        const [headText, refsText, packsText] = await Promise.all([
+          fetchRepoText('HEAD'), fetchRepoText('info/refs'), fetchRepoText('objects/info/packs', true)
+        ]);
+        branchOids = parseInfoRefs(refsText);
+        branches = Object.keys(branchOids).sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
+        packNames = parsePackList(packsText);
+        if (!branches.length) throw new Error('No branches found in info/refs. Run git --bare update-server-info.');
+
+        const headRef = headText.trim().match(/^ref:\s*(refs\/heads\/.+)$/);
+        defaultBranch = headRef ? headRef[1].slice('refs/heads/'.length) : null;
+        headOid = headRef ? branchOids[defaultBranch] : headText.trim().toLowerCase();
+        if (!headOid) {
+          defaultBranch = branches.includes('main') ? 'main' : branches.includes('master') ? 'master' : branches[0];
+          headOid = branchOids[defaultBranch];
+        }
+        selectedBranch = branchOids[requestedBranch] ? requestedBranch : defaultBranch;
+        branchTip = branchOids[selectedBranch];
+        selectedCommit = /^[0-9a-f]{40,64}$/i.test(requestedCommit || '') ? requestedCommit.toLowerCase() : branchTip;
+
+        localFS = new LightningFS(cacheId(BASE_URL + '|dumb-http-index-prefetch-lazy-pack-buffer-global-v12'));
+        localPromises = localFS.promises;
+        fs = localFS;
+        installDumbHttpFallback();
+
+        await ensureDir(GIT_DIR + '/objects/pack');
+        await ensureDir(GIT_DIR + '/refs/heads');
+        await writeLocalRef('refs/heads/__viewer_current', selectedCommit);
+        await writeLocalRef('refs/heads/__viewer_history', branchTip || selectedCommit);
+
+        const normalizedUrl = buildUrl({ branch: selectedBranch, commit: selectedCommit, path: requestedPath, history: historyDepth });
+        if (normalizedUrl !== window.location.pathname + window.location.search + window.location.hash) {
+          window.history.replaceState(null, '', normalizedUrl);
+        }
+
+        setupBranchSelect();
+        const oidSpan = makeElement('span', 'oid', shortOid(selectedCommit))
+        oidSpan.title = selectedCommit;
+        $('currentCommit').appendChild(oidSpan);
+        $('currentCommit').appendChild(makeElement('span', 'commit-summary', " " + (selectedCommit === headOid ? '(HEAD)' : selectedCommit === branchTip ? '(branch last)' : '(historical)')));
+        $('historyToggle').addEventListener('click', toggleHistory);
+
+        setNotice(`Repository: ${branches.length} branches. Preparing indexes…`);
+        await preloadPackIndexes();
+
+        const entry = await getPathEntry(selectedCommit, requestedPath);
+        const isDirectory = entry?.type === 'tree';
+        const isFile = entry?.type === 'blob';
+        const directoryPath = isDirectory ? requestedPath : parentPath(requestedPath);
+        const directoryEntry = isDirectory ? entry : await getPathEntry(selectedCommit, directoryPath);
+
+        if (directoryEntry?.type === 'tree') await renderDirectory(directoryEntry.oid, directoryPath, isFile ? requestedPath : '');
+        else {
+          $('directoryTitle').textContent = 'Files';
+          $('fileList').replaceChildren(makeElement('div', 'empty', 'Directory not found.'));
+        }
+
+        if (!entry) {
+          $('viewTitle').textContent = 'Path not found';
+          $('content').replaceChildren(makeElement('div', 'empty', `Path “${requestedPath}” does not exist in commit ${shortOid(selectedCommit)}.`));
+        } else if (entry.type === 'blob') {
+          await renderFile(entry, requestedPath);
+        } else if (entry.type === 'tree') {
+          showDirectoryPrompt(requestedPath);
+        } else {
+          $('viewTitle').textContent = requestedPath;
+          $('content').replaceChildren(makeElement('div', 'empty', `Entry of type ${entry.type}; object ${entry.oid}.`));
+        }
+        setNotice('');
+      }
+
+      function showError(error) {
+        setNotice(error?.message || String(error), true);
+      }
+
+      start().catch(error => {
+        showError(error);
+        $('fileList').replaceChildren(makeElement('div', 'empty', 'Failed to load repository files.'));
+        $('content').replaceChildren(makeElement('div', 'empty', 'Failed to open repository.'));
+      });
+    })();
+  </script>
+</body>
+</html>
