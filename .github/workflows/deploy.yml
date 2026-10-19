@@ -37,6 +37,7 @@ jobs:
       - name: Create demo
         run: |
           mv JSWebGit.tgz output
+          sed -e 's#const rootURL = "/";#const rootURL = "/JSWebGit/";#' -i output/git.html
           echo '<html lang="en"> <head> <meta charset="utf-8"> <title>JSWebGit Demo</title> </head> <body>' > output/index.html
           cat README.md >> output/index.html
           echo '</body> </html>' >> output/index.html
